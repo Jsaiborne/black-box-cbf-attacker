@@ -3,6 +3,7 @@ import time
 import argparse
 import statistics
 import math
+import csv
 import matplotlib
 matplotlib.use('Agg')  # Safe for servers/headless
 import matplotlib.pyplot as plt
@@ -17,21 +18,21 @@ U_SIZE = 5000          # size of universe (scannable range)
 RATE_LIMITS = [10000, 5000, 2000, 1000, 500, 200, 100]
 
 # Sweep M/N ratios (list). The code computes M = round(ratio * N)
-M_N_RATIOS = [8, 12, 16, 24]   # example ratios to sweep; add/remove as needed
+M_N_RATIOS = [8, 12, 16]   # example ratios to sweep; add/remove as needed
 
 # Attack / algorithm choices
 ENABLE_PAIRS = True    # set to False to disable pair-testing (edit in-code)
-PAIR_BUDGET = 500      # max pair tests per experiment (edit in-code)
+PAIR_BUDGET = 1000      # max pair tests per experiment (edit in-code)
 CHECK_BUDGET = None    # None => full-scan P; integer => sample when building Prem
 
 # Trials / reproducibility / churn model
-TRIALS = 20            # default number of independent trials per rate-limit
-SEED_BASE = None       # if int, base seed; per-trial seed used = SEED_BASE + trial_index
+TRIALS = 20         # default number of independent trials per rate-limit
+SEED_BASE = 42       # if int, base seed; per-trial seed used = SEED_BASE + trial_index
 CHURN_MODEL = 'query'  # 'query' (churn triggered by hitting query_limit) or 'time'/'poisson'/'bursty'
 TIME_INTERVAL = None   # when churn_model='time', churn every TIME_INTERVAL accesses (None -> use query_limit)
 
 # FP measurement
-FP_SAMPLE_SIZE = 1000  # number of non-members to sample for empirical FP measurement per trial
+FP_SAMPLE_SIZE =3000  # number of non-members to sample for empirical FP measurement per trial
 
 # Misc
 VERBOSE = False        # set True to see per-trial prints
@@ -50,11 +51,12 @@ except ImportError:
     exit()
 
 
-# ---------- ThrottledOracle (kept lightweight; same as before) ----------
+# ---------- ThrottledOracle (instrumented for logging) ----------
 class ThrottledOracle:
     def __init__(self, cbf, true_set, universe, query_limit, churn_amount,
                  churn_model='query', time_between_churns=None):
         self.cbf = cbf
+        # store a reference to the server's true set (list)
         self.true_set = true_set
         self.universe = universe
         self.query_limit = query_limit
@@ -62,15 +64,20 @@ class ThrottledOracle:
         self.churn_model = churn_model
         self.time_between_churns = time_between_churns if time_between_churns is not None else query_limit
 
-        self.queries_made = 0
+        # Counters for diagnostics / logging
+        self.queries_made = 0         # counts accesses since last query-limit reset (kept for compatibility)
+        self.total_accesses = 0       # total accesses across the entire trial (new)
         self.time_counter = 0
         self.total_days_passed = 0
         self.churn_events = 0
 
     def access(self, operation, item):
+        # increment counters
+        self.total_accesses += 1
         self.queries_made += 1
         self.time_counter += 1
 
+        # original behavior for triggering churn
         if self.churn_model == 'query':
             if self.queries_made >= self.query_limit:
                 self._apply_data_churn()
@@ -82,19 +89,19 @@ class ThrottledOracle:
                 self.time_counter = 0
                 self.total_days_passed += 1
         elif self.churn_model == 'poisson':
-            # simple per-access stochastic trigger (small p)
-            p = min(1.0, 1e-4)  # default small; user can change by modifying oracle creation if desired
+            p = min(1.0, 1e-4)  # default small; change when instantiating oracle if desired
             if random.random() < p:
                 self._apply_data_churn()
                 self.total_days_passed += 1
         # else: other models could be added
 
+        # perform the cbf operation
         if operation == 'check':
             return self.cbf.check(item)
         elif operation == 'add':
-            self.cbf.add(item)
+            return self.cbf.add(item)
         elif operation == 'remove':
-            self.cbf.remove(item)
+            return self.cbf.remove(item)
 
     def _apply_data_churn(self):
         self.churn_events += 1
@@ -279,9 +286,9 @@ def run_black_box_attack(oracle, universe, enable_pairs=False, pair_budget=1000,
     return Srec
 
 
-# ---------- MAIN: sweep M/N ratios and rate_limits, measure empirical FP ----------
+# ---------- MAIN: sweep M/N ratios and rate_limits, measure empirical FP & CSV logging ----------
 def main():
-    parser = argparse.ArgumentParser(description="CBF black-box peeling attack simulation with m/n sweep and empirical FP.")
+    parser = argparse.ArgumentParser(description="CBF black-box peeling attack simulation with m/n sweep and empirical FP and CSV logging.")
     parser.add_argument("--trials", type=int, default=None, help="override TRIALS constant")
     parser.add_argument("--pairs", action="store_true", help="enable pair-testing (overrides ENABLE_PAIRS)")
     parser.add_argument("--pair-budget", type=int, default=None, help="override PAIR_BUDGET")
@@ -305,6 +312,21 @@ def main():
     universe = list(range(1, U_SIZE + 1))
     churn_per_cycle = 5  # keep same as before; could be exposed as constant if desired
 
+    # CSV diagnostics file (overwrite existing)
+    csv_filename = "detailed_results.csv"
+    with open(csv_filename, "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow([
+            "ratio", "M_passed", "K", "effective_m",
+            "trial_idx", "seed",
+            "rate_limit",
+            "empirical_fp_pct", "theoretical_fp_pct",
+            "occupancy_pct", "initial_P_size",
+            "recovered_count", "true_positives_found",
+            "recall_pct", "precision_pct",
+            "total_accesses", "days_passed", "churn_events"
+        ])
+
     # Prepare plotting containers: for each m/n ratio we'll collect mean recall/precision lists
     all_mean_recalls = {}
     all_std_recalls = {}
@@ -317,11 +339,11 @@ def main():
     print(f"Running experiments: N={N_local}, trials={trials}, m/n ratios={M_N_RATIOS}, rate_limits={RATE_LIMITS}")
     for ratio in M_N_RATIOS:
         M_local = max(1, int(round(ratio * N_local)))
-        # compute optimal K unless user provides through CLI constant (we didn't expose K constant here)
+        # compute optimal K
         k_float = (M_local / N_local) * math.log(2)
         K_local = max(1, int(round(k_float)))
         if verbose:
-            print(f"\n=== ratio={ratio} -> M={M_local}, computed K_opt={K_local} ===\n")
+            print(f"\n=== ratio={ratio} -> M_passed={M_local}, computed K_opt={K_local} ===\n")
 
         mean_recalls = []
         std_recalls = []
@@ -339,9 +361,11 @@ def main():
             fps = []  # empirical fp per trial (measured before attack)
 
             for t in range(trials):
-                # seed for reproducibility per trial
+                # reproducible seed per trial (if provided)
+                trial_seed = None
                 if seed_base is not None:
-                    random.seed(seed_base + t)
+                    trial_seed = seed_base + t
+                    random.seed(trial_seed)
 
                 # Setup CBF and insert true_set
                 cbf = CountingBloomFilter(M_local, K_local)
@@ -349,25 +373,91 @@ def main():
                 for x in true_set:
                     cbf.add(x)
 
-                # Empirical FP measurement: sample non-members and check via cbf.check (NOT oracle)
+                # 1) Determine effective m from cbf internals (try several likely attributes)
+                effective_m = None
+                # first try attributes that hold arrays of counters/bits
+                candidates = ['bloom_structure', 'counters', 'count_array', 'array', 'bits', 'counts', 'bitarray', 'bloom']
+                for attr in candidates:
+                    if hasattr(cbf, attr):
+                        val = getattr(cbf, attr)
+                        try:
+                            effective_m = len(val)
+                        except Exception:
+                            # if it's a numeric attribute (not list), use directly if sensible
+                            try:
+                                effective_m = int(val)
+                            except Exception:
+                                effective_m = None
+                        break
+                # fallback: try common single-name fields
+                if effective_m is None:
+                    for key, val in cbf.__dict__.items():
+                        # prefer list-like attributes
+                        try:
+                            if isinstance(val, (list, tuple)):
+                                effective_m = len(val)
+                                break
+                        except Exception:
+                            continue
+                # final fallback: use passed M_local
+                if effective_m is None:
+                    effective_m = M_local
+
+                # 2) theoretical FP using effective_m
+                p_theory_eff = (1.0 - math.exp(- (K_local * N_local) / float(effective_m))) ** K_local
+                p_theory_pct = p_theory_eff * 100.0
+
+                # 3) empirical FP measurement: sample non-members and check via cbf.check (NOT oracle)
                 non_members = [x for x in universe if x not in true_set]
                 sample_size = min(fp_samples, len(non_members))
                 sample_non_members = random.sample(non_members, sample_size)
                 fp_count = 0
                 for y in sample_non_members:
-                    if cbf.check(y):
-                        fp_count += 1
+                    try:
+                        if cbf.check(y):
+                            fp_count += 1
+                    except Exception:
+                        # if check raises for unexpected reasons, treat as negative to avoid failing whole run
+                        pass
                 empirical_fp = (fp_count / sample_size) * 100.0 if sample_size > 0 else 0.0
                 fps.append(empirical_fp)
 
-                # Setup oracle with a fresh wrapper around the cbf/true_set
-                oracle = ThrottledOracle(cbf, true_set, universe,
-                                         query_limit=limit,
-                                         churn_amount=churn_per_cycle,
+                # 4) occupancy probe (try common internal names)
+                occupancy = None
+                counters = None
+                candidates_occ = ['bloom_structure', 'counters', 'count_array', 'array', 'bits', 'counts', 'bitarray', 'bloom']
+                for attr in candidates_occ:
+                    if hasattr(cbf, attr):
+                        counters = getattr(cbf, attr)
+                        break
+                if counters is not None:
+                    try:
+                        non_zero = sum(1 for v in counters if v > 0)
+                        occupancy = (non_zero / float(len(counters))) * 100.0
+                    except Exception:
+                        occupancy = None
+
+                # 5) Build oracle to compute attacker's observed P without consuming the main oracle budget:
+                oracle_for_P = ThrottledOracle(cbf, list(true_set), universe,
+                                               query_limit=limit, churn_amount=churn_per_cycle,
+                                               churn_model=CHURN_MODEL,
+                                               time_between_churns=(TIME_INTERVAL if TIME_INTERVAL is not None else limit))
+                P = []
+                # Discovery via oracle_for_P (this may cause churn on its own, but we used a copy of true_set inside oracle_for_P)
+                for x in universe:
+                    if oracle_for_P.access('check', x):
+                        P.append(x)
+                initial_P_size = len(P)
+
+                # 6) Run the actual attack on a fresh CBF + oracle so the measurement above doesn't affect the attack
+                cbf_attack = CountingBloomFilter(M_local, K_local)
+                for x in true_set:
+                    cbf_attack.add(x)
+                oracle = ThrottledOracle(cbf_attack, list(true_set), universe,
+                                         query_limit=limit, churn_amount=churn_per_cycle,
                                          churn_model=CHURN_MODEL,
                                          time_between_churns=(TIME_INTERVAL if TIME_INTERVAL is not None else limit))
 
-                # Run attack
                 extracted_elements = run_black_box_attack(oracle, universe,
                                                           enable_pairs=enable_pairs,
                                                           pair_budget=pair_budget,
@@ -378,16 +468,37 @@ def main():
                 current_server_set = set(oracle.true_set)
                 found_set = set(extracted_elements)
                 true_positives_found = len(found_set.intersection(current_server_set))
+                recovered_count = len(found_set)
 
                 recall = (true_positives_found / N_local) * 100 if N_local > 0 else 0
-                precision = (true_positives_found / len(found_set)) * 100 if len(found_set) > 0 else 0
+                precision = (true_positives_found / recovered_count) * 100 if recovered_count > 0 else 0
 
                 recalls.append(recall)
                 precisions.append(precision)
                 days.append(oracle.total_days_passed)
 
-                if verbose:
-                    print(f"ratio={ratio} limit={limit} trial={t+1}/{trials} FP={empirical_fp:.3f}% recall={recall:.1f}% prec={precision:.1f}% days={oracle.total_days_passed}")
+                # gather diagnostics for CSV
+                total_accesses = getattr(oracle, "total_accesses", "")
+                days_passed = getattr(oracle, "total_days_passed", "")
+                churn_events = getattr(oracle, "churn_events", "")
+
+                # write CSV row
+                with open(csv_filename, "a", newline="") as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerow([
+                        ratio, M_local, K_local, effective_m,
+                        t, (trial_seed if trial_seed is not None else ""),
+                        limit,
+                        f"{empirical_fp:.6f}", f"{p_theory_pct:.6f}",
+                        (f"{occupancy:.6f}" if occupancy is not None else ""),
+                        initial_P_size,
+                        recovered_count, true_positives_found,
+                        f"{recall:.6f}", f"{precision:.6f}",
+                        (total_accesses if total_accesses is not None else ""), (days_passed if days_passed is not None else ""), (churn_events if churn_events is not None else "")
+                    ])
+
+                # compact debug line
+                print(f"DEBUG trial ratio={ratio} M_passed={M_local} effective_m={effective_m} limit={limit} t={t} seed={trial_seed} theory_fp={p_theory_pct:.4f}% emp_fp={empirical_fp:.4f}% occ={('N/A' if occupancy is None else f'{occupancy:.2f}%')} |P|={initial_P_size} recov={recovered_count} tp={true_positives_found} recall={recall:.2f}% prec={precision:.2f}% accesses={total_accesses} days={days_passed} churns={churn_events}")
 
             # aggregate per rate limit
             mean_rec = statistics.mean(recalls)
@@ -447,13 +558,12 @@ def main():
     # Also print a compact summary table of empirical FP (means) per ratio (they are independent of rate limit)
     print("\nEmpirical FP summary (mean ± std) per m/n ratio (averaged across trials and rate limits):")
     for ratio in M_N_RATIOS:
-        # compute average across rate_limits of the mean_fp list
         fps_list = all_mean_fp[ratio]
         avg_fp = statistics.mean(fps_list)
         stdev_fp = statistics.mean(all_std_fp[ratio]) if len(all_std_fp[ratio]) > 0 else 0.0
         print(f"m/n={ratio:>5} -> empirical FP (avg across rate_limits) = {avg_fp:.4f}%  (avg std {stdev_fp:.4f}%)")
 
-    print("\nDone.")
+    print("\nDone. CSV written to", csv_filename)
 
 if __name__ == "__main__":
     main()
