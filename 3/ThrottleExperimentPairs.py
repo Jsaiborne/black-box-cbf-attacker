@@ -11,30 +11,27 @@ import matplotlib.pyplot as plt
 # ============== USER-EDITABLE CONSTANTS ==========
 # Edit these for quick experiments (CLI will override)
 # =================================================
-# Basic workload
-N = 150                # number of true elements initially inserted
-U_SIZE = 5000          # size of universe (scannable range)
-RATE_LIMITS = [10000, 5000, 2000, 1000, 500, 200, 100]
-
-# Sweep M/N ratios (list). The code computes M = round(ratio * N)
-M_N_RATIOS = [8, 12, 16, 24]   # example ratios to sweep; add/remove as needed
+# Filter / universe / workload
+M = 5000               # filter size (number of counters)
+K = None               # number of hash functions; if None, compute optimal k from M/N
+N = 500                # number of true elements initially inserted
+U_SIZE = 50000          # size of universe (scannable range)
+RATE_LIMITS = [10000, 5000, 2000, 1000, 500, 200, 100]  # list of rate limits to test
+CHURN_PER_CYCLE = 100    # number of elements changed per churn event
 
 # Attack / algorithm choices
 ENABLE_PAIRS = True    # set to False to disable pair-testing (edit in-code)
 PAIR_BUDGET = 500      # max pair tests per experiment (edit in-code)
-CHECK_BUDGET = None    # None => full-scan P; integer => sample when building Prem
+CHECK_BUDGET = None    # None => full-scan P; int => sample this many y in P when building Prem
 
 # Trials / reproducibility / churn model
-TRIALS = 20            # default number of independent trials per rate-limit
+TRIALS = 5            # default number of independent trials per rate-limit
 SEED_BASE = None       # if int, base seed; per-trial seed used = SEED_BASE + trial_index
-CHURN_MODEL = 'query'  # 'query' (churn triggered by hitting query_limit) or 'time'/'poisson'/'bursty'
+CHURN_MODEL = 'query'  # 'query' (churn triggered by hitting query_limit) or 'time' (periodic churn)
 TIME_INTERVAL = None   # when churn_model='time', churn every TIME_INTERVAL accesses (None -> use query_limit)
 
-# FP measurement
-FP_SAMPLE_SIZE = 1000  # number of non-members to sample for empirical FP measurement per trial
-
 # Misc
-VERBOSE = False        # set True to see per-trial prints
+VERBOSE = False        # set True to get more prints (per-trial messages)
 OUTPUT_FILENAME = None # if None a filename will be auto-generated
 
 # =================================================
@@ -42,7 +39,7 @@ OUTPUT_FILENAME = None # if None a filename will be auto-generated
 # =================================================
 
 
-# Import your existing class (must be in same directory)
+# Import your existing class
 try:
     from CountingBloomFilter import CountingBloomFilter
 except ImportError:
@@ -50,8 +47,19 @@ except ImportError:
     exit()
 
 
-# ---------- ThrottledOracle (kept lightweight; same as before) ----------
+# ==========================================
+# 1. THE THROTTLED FILTER WRAPPER
+# ==========================================
 class ThrottledOracle:
+    """
+    Wraps the CBF to simulate an API that:
+      - Counts queries (Rate Limiting)
+      - Changes data automatically (Data Churn)
+
+    churn_model:
+      - 'query' : churn fires when query_limit is reached (original behavior)
+      - 'time'  : churn fires every time_between_churns accesses regardless of query limit
+    """
     def __init__(self, cbf, true_set, universe, query_limit, churn_amount,
                  churn_model='query', time_between_churns=None):
         self.cbf = cbf
@@ -68,27 +76,25 @@ class ThrottledOracle:
         self.churn_events = 0
 
     def access(self, operation, item):
+        # update counters
         self.queries_made += 1
         self.time_counter += 1
 
+        # query-driven churn
         if self.churn_model == 'query':
             if self.queries_made >= self.query_limit:
                 self._apply_data_churn()
                 self.queries_made = 0
                 self.total_days_passed += 1
+
+        # time-driven churn
         elif self.churn_model == 'time':
             if self.time_counter >= self.time_between_churns:
                 self._apply_data_churn()
                 self.time_counter = 0
                 self.total_days_passed += 1
-        elif self.churn_model == 'poisson':
-            # simple per-access stochastic trigger (small p)
-            p = min(1.0, 1e-4)  # default small; user can change by modifying oracle creation if desired
-            if random.random() < p:
-                self._apply_data_churn()
-                self.total_days_passed += 1
-        # else: other models could be added
 
+        # actual CBF operation
         if operation == 'check':
             return self.cbf.check(item)
         elif operation == 'add':
@@ -103,46 +109,63 @@ class ThrottledOracle:
                 break
             idx_to_remove = random.randrange(len(self.true_set))
             old_item = self.true_set.pop(idx_to_remove)
-            try:
-                self.cbf.remove(old_item)
-            except Exception:
-                pass
+            self.cbf.remove(old_item)
 
-            # add new unique
+            # add a new item (rejection sample)
             new_item = random.randint(1, len(self.universe))
             while new_item in self.true_set:
                 new_item = random.randint(1, len(self.universe))
             self.true_set.append(new_item)
-            try:
-                self.cbf.add(new_item)
-            except Exception:
-                pass
+            self.cbf.add(new_item)
 
 
-# ---------- Attacker implementation (single + optional pair testing) ----------
+# ==========================================
+# 2. THE BLACK-BOX ATTACKER (WITH PAIR TOGGLE)
+#    Accepts check_budget to control Prem-building
+# ==========================================
 def run_black_box_attack(oracle, universe, enable_pairs=False, pair_budget=1000, check_budget=None, verbose=False):
-    # --- DISCOVERY ---
+    """
+    - check_budget: None => full scan of P when building Prem; otherwise random sample of up to check_budget elements.
+    """
+    # PHASE 1: DISCOVERY
+    if verbose:
+        print("Scanning universe to compute P (positives)...")
     P = []
     for x in universe:
         if oracle.access('check', x):
             P.append(x)
+    if verbose:
+        print(f"Initial positives found: {len(P)}")
 
     Srec = []
 
+    # helper to build Prem using check_budget
     def build_Prem_excluding(exclude_set):
+        """
+        exclude_set: set of elements to exclude from checks (e.g., {x} or {x,y})
+        Returns: Prem set (subset of P that remain positive)
+        """
         candidates = [y for y in P if y not in exclude_set]
+        # full scan
         if check_budget is None:
             subset = candidates
         else:
-            subset = random.sample(candidates, min(len(candidates), check_budget))
+            if len(candidates) > check_budget:
+                subset = random.sample(candidates, check_budget)
+            else:
+                subset = candidates
+
         Prem_local = set()
         for y in subset:
             if oracle.access('check', y):
                 Prem_local.add(y)
         return Prem_local, subset
 
+    # Single-element test
     def test_element(x, P):
+        # remove x
         oracle.access('remove', x)
+        # check x
         x_still_positive = oracle.access('check', x)
         if x_still_positive:
             oracle.access('add', x)
@@ -151,36 +174,46 @@ def run_black_box_attack(oracle, universe, enable_pairs=False, pair_budget=1000,
         Prem, _ = build_Prem_excluding({x})
         R = [y for y in P if y != x and y not in Prem]
 
+        # Case A: only x disappeared
         if set(P) == Prem.union({x}):
-            if x in P: P.remove(x)
+            if x in P:
+                P.remove(x)
             Srec.append(x)
             if verbose:
-                print(f"singleton confirm {x}")
+                print(f"test_element: confirmed singleton {x}")
             return True
 
+        # Case B: some R disappeared -> insert R & re-check
         if R:
             for z in R:
                 oracle.access('add', z)
             x_pos_after_inserting_R = oracle.access('check', x)
+
             if not x_pos_after_inserting_R:
+                # x confirmed; R are false positives
                 for z in R:
-                    if z in P: P.remove(z)
+                    if z in P:
+                        P.remove(z)
                     oracle.access('remove', z)
-                if x in P: P.remove(x)
+                if x in P:
+                    P.remove(x)
                 Srec.append(x)
                 if verbose:
-                    print(f"singleton confirm {x} after inserting R")
+                    print(f"test_element: confirmed {x} after inserting R (|R|={len(R)})")
                 return True
             else:
                 for z in R:
                     oracle.access('remove', z)
 
+        # restore x
         oracle.access('add', x)
         return False
 
+    # Pair test (heuristic)
     def test_pair(x, y, P):
         oracle.access('remove', x)
         oracle.access('remove', y)
+
         x_pos = oracle.access('check', x)
         y_pos = oracle.access('check', y)
         if x_pos and y_pos:
@@ -191,12 +224,13 @@ def run_black_box_attack(oracle, universe, enable_pairs=False, pair_budget=1000,
         Prem, _ = build_Prem_excluding({x, y})
         R = [z for z in P if z not in Prem and z not in (x, y)]
 
+        # Case A: both disappeared and no others
         if set(P) == Prem.union({x, y}):
             if x in P: P.remove(x)
             if y in P: P.remove(y)
             Srec.extend([x, y])
             if verbose:
-                print(f"pair confirm ({x},{y})")
+                print(f"test_pair: confirmed pair ({x},{y})")
             return True
 
         if R:
@@ -227,7 +261,7 @@ def run_black_box_attack(oracle, universe, enable_pairs=False, pair_budget=1000,
 
             if found_any:
                 if verbose:
-                    print(f"pair deduced from ({x},{y}), found_any={found_any}")
+                    print(f"test_pair: confirmed from pair ({x},{y}), found_any={found_any}, |R|={len(R)}")
                 return True
             else:
                 oracle.access('add', x)
@@ -276,184 +310,160 @@ def run_black_box_attack(oracle, universe, enable_pairs=False, pair_budget=1000,
                 if pair_checks_done >= pair_budget or len(P) < 2:
                     break
 
+    if verbose:
+        print(f"Recovered {len(Srec)} elements via peeling (pairs={enable_pairs}).")
     return Srec
 
 
-# ---------- MAIN: sweep M/N ratios and rate_limits, measure empirical FP ----------
+# ==========================================
+# 3. EXPERIMENT EXECUTION (MULTI-TRIALS)
+# ==========================================
 def main():
-    parser = argparse.ArgumentParser(description="CBF black-box peeling attack simulation with m/n sweep and empirical FP.")
-    parser.add_argument("--trials", type=int, default=None, help="override TRIALS constant")
-    parser.add_argument("--pairs", action="store_true", help="enable pair-testing (overrides ENABLE_PAIRS)")
-    parser.add_argument("--pair-budget", type=int, default=None, help="override PAIR_BUDGET")
-    parser.add_argument("--seed", type=int, default=None, help="seed base (per-trial: seed+trial_index)")
-    parser.add_argument("--check-budget", type=int, default=None, help="override CHECK_BUDGET")
-    parser.add_argument("--fp-samples", type=int, default=None, help="override FP_SAMPLE_SIZE")
-    parser.add_argument("--verbose", action="store_true", help="verbose output")
-    parser.add_argument("--output", type=str, default=None, help="plot filename override")
+    parser = argparse.ArgumentParser(description="CBF black-box peeling attack simulation.")
+    parser.add_argument("--pairs", action="store_true", help="Enable pair-testing (Algorithm 2). Overrides ENABLE_PAIRS.")
+    parser.add_argument("--pair-budget", type=int, default=None, help="Max pair tests per experiment (overrides PAIR_BUDGET).")
+    parser.add_argument("--trials", type=int, default=None, help="Number of independent trials per rate-limit (overrides TRIALS).")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed base. If provided, trial seed = seed + trial_index.")
+    parser.add_argument("--churn-model", choices=['query', 'time'], default=None, help="Churn model override.")
+    parser.add_argument("--time-interval", type=int, default=None, help="Used with --churn-model time: accesses between churn events.")
+    parser.add_argument("--k", type=int, default=None, help="Override K (number of hash functions). If omitted and K constant is None, optimal k is computed.")
+    parser.add_argument("--check-budget", type=int, default=None, help="Override CHECK_BUDGET (how many y in P to check when building Prem).")
+    parser.add_argument("--verbose", action="store_true", help="Verbose output (overrides VERBOSE).")
+    parser.add_argument("--output", type=str, default=None, help="Output filename for plot (overrides OUTPUT_FILENAME).")
+
     args = parser.parse_args()
 
-    trials = args.trials if args.trials is not None else TRIALS
-    enable_pairs = args.pairs if args.pairs else ENABLE_PAIRS
-    pair_budget = args.pair_budget if args.pair_budget is not None else PAIR_BUDGET
-    seed_base = args.seed if args.seed is not None else SEED_BASE
-    check_budget = args.check_budget if args.check_budget is not None else CHECK_BUDGET
-    fp_samples = args.fp_samples if args.fp_samples is not None else FP_SAMPLE_SIZE
-    verbose = args.verbose if args.verbose else VERBOSE
-    output_filename = args.output if args.output is not None else OUTPUT_FILENAME
-
+    # Resolve settings: constants first, override with CLI where provided
+    M_local = M
+    K_local = K
+    if args.k is not None:
+        K_local = args.k
     N_local = N
-    universe = list(range(1, U_SIZE + 1))
-    churn_per_cycle = 5  # keep same as before; could be exposed as constant if desired
+    U_size_local = U_SIZE
+    RATE_LIMITS_local = RATE_LIMITS.copy()
+    CHURN_PER_CYCLE_local = CHURN_PER_CYCLE
 
-    # Prepare plotting containers: for each m/n ratio we'll collect mean recall/precision lists
-    all_mean_recalls = {}
-    all_std_recalls = {}
-    all_mean_precisions = {}
-    all_std_precisions = {}
-    all_mean_days = {}
-    all_mean_fp = {}
-    all_std_fp = {}
+    trials_local = args.trials if args.trials is not None else TRIALS
+    enable_pairs_local = args.pairs if args.pairs else ENABLE_PAIRS
+    pair_budget_local = args.pair_budget if args.pair_budget is not None else PAIR_BUDGET
+    check_budget_local = args.check_budget if args.check_budget is not None else CHECK_BUDGET
+    seed_base_local = args.seed if args.seed is not None else SEED_BASE
+    churn_model_local = args.churn_model if args.churn_model is not None else CHURN_MODEL
+    time_interval_local = args.time_interval if args.time_interval is not None else TIME_INTERVAL
+    verbose_local = args.verbose if args.verbose else VERBOSE
+    output_filename_local = args.output if args.output is not None else OUTPUT_FILENAME
 
-    print(f"Running experiments: N={N_local}, trials={trials}, m/n ratios={M_N_RATIOS}, rate_limits={RATE_LIMITS}")
-    for ratio in M_N_RATIOS:
-        M_local = max(1, int(round(ratio * N_local)))
-        # compute optimal K unless user provides through CLI constant (we didn't expose K constant here)
-        k_float = (M_local / N_local) * math.log(2)
-        K_local = max(1, int(round(k_float)))
-        if verbose:
-            print(f"\n=== ratio={ratio} -> M={M_local}, computed K_opt={K_local} ===\n")
+    # compute K if needed
+    if K_local is None:
+        if N_local <= 0:
+            K_local = 1
+        else:
+            k_float = (M_local / N_local) * math.log(2)
+            K_local = max(1, int(round(k_float)))
+            if verbose_local:
+                print(f"Computed optimal k from formula: k_float={k_float:.3f} -> k_opt={K_local}")
 
-        mean_recalls = []
-        std_recalls = []
-        mean_precisions = []
-        std_precisions = []
-        mean_days = []
-        mean_fp_rates = []
-        std_fp_rates = []
+    # Universe
+    universe = list(range(1, U_size_local + 1))
 
-        # For each rate limit, run 'trials' experiments
-        for limit in RATE_LIMITS:
-            recalls = []
-            precisions = []
-            days = []
-            fps = []  # empirical fp per trial (measured before attack)
+    print(f"--- Starting Simulation [N={N_local}, M={M_local}, K={K_local}, trials={trials_local}, churn_model={churn_model_local}] ---")
+    if seed_base_local is not None:
+        print(f"Using seed base = {seed_base_local} (per-trial seeds = seed_base + trial_index).")
+    if check_budget_local is None:
+        print("CHECK_BUDGET = None (full scan of P when building Prem).")
+    else:
+        print(f"CHECK_BUDGET = {check_budget_local} (sample up to this many y from P when building Prem).")
 
-            for t in range(trials):
-                # seed for reproducibility per trial
-                if seed_base is not None:
-                    random.seed(seed_base + t)
+    print(f"{'Rate Limit':<12} | {'Recall (mean±std)':<22} | {'Precision (mean±std)':<24} | {'Days Passed (mean)':<16}")
+    print("-" * 90)
 
-                # Setup CBF and insert true_set
-                cbf = CountingBloomFilter(M_local, K_local)
-                true_set = random.sample(universe, N_local)
-                for x in true_set:
-                    cbf.add(x)
+    mean_recalls = []
+    std_recalls = []
+    mean_precisions = []
+    std_precisions = []
+    mean_days = []
 
-                # Empirical FP measurement: sample non-members and check via cbf.check (NOT oracle)
-                non_members = [x for x in universe if x not in true_set]
-                sample_size = min(fp_samples, len(non_members))
-                sample_non_members = random.sample(non_members, sample_size)
-                fp_count = 0
-                for y in sample_non_members:
-                    if cbf.check(y):
-                        fp_count += 1
-                empirical_fp = (fp_count / sample_size) * 100.0 if sample_size > 0 else 0.0
-                fps.append(empirical_fp)
+    for limit in RATE_LIMITS_local:
+        recalls = []
+        precisions = []
+        days = []
 
-                # Setup oracle with a fresh wrapper around the cbf/true_set
-                oracle = ThrottledOracle(cbf, true_set, universe,
-                                         query_limit=limit,
-                                         churn_amount=churn_per_cycle,
-                                         churn_model=CHURN_MODEL,
-                                         time_between_churns=(TIME_INTERVAL if TIME_INTERVAL is not None else limit))
+        for t in range(trials_local):
+            # per-trial seed for reproducibility (if provided)
+            if seed_base_local is not None:
+                trial_seed = seed_base_local + t
+                random.seed(trial_seed)
+            else:
+                # if no seed specified leave RNG as-is (non-deterministic)
+                pass
 
-                # Run attack
-                extracted_elements = run_black_box_attack(oracle, universe,
-                                                          enable_pairs=enable_pairs,
-                                                          pair_budget=pair_budget,
-                                                          check_budget=check_budget,
-                                                          verbose=verbose)
+            # Setup CBF and server true set
+            cbf = CountingBloomFilter(M_local, K_local)
+            true_set = random.sample(universe, N_local)
+            for x in true_set:
+                cbf.add(x)
 
-                # Evaluate
-                current_server_set = set(oracle.true_set)
-                found_set = set(extracted_elements)
-                true_positives_found = len(found_set.intersection(current_server_set))
+            # Setup oracle
+            oracle = ThrottledOracle(cbf, true_set, universe,
+                                     query_limit=limit,
+                                     churn_amount=CHURN_PER_CYCLE_local,
+                                     churn_model=churn_model_local,
+                                     time_between_churns=(time_interval_local if time_interval_local is not None else limit))
 
-                recall = (true_positives_found / N_local) * 100 if N_local > 0 else 0
-                precision = (true_positives_found / len(found_set)) * 100 if len(found_set) > 0 else 0
+            # Run attack
+            extracted_elements = run_black_box_attack(oracle, universe,
+                                                      enable_pairs=enable_pairs_local,
+                                                      pair_budget=pair_budget_local,
+                                                      check_budget=check_budget_local,
+                                                      verbose=verbose_local)
 
-                recalls.append(recall)
-                precisions.append(precision)
-                days.append(oracle.total_days_passed)
+            # Evaluate
+            current_server_set = set(oracle.true_set)
+            found_set = set(extracted_elements)
+            true_positives_found = len(found_set.intersection(current_server_set))
 
-                if verbose:
-                    print(f"ratio={ratio} limit={limit} trial={t+1}/{trials} FP={empirical_fp:.3f}% recall={recall:.1f}% prec={precision:.1f}% days={oracle.total_days_passed}")
+            recall = (true_positives_found / N_local) * 100 if N_local > 0 else 0
+            precision = (true_positives_found / len(found_set)) * 100 if len(found_set) > 0 else 0
 
-            # aggregate per rate limit
-            mean_rec = statistics.mean(recalls)
-            std_rec = statistics.stdev(recalls) if len(recalls) > 1 else 0.0
-            mean_prec = statistics.mean(precisions)
-            std_prec = statistics.stdev(precisions) if len(precisions) > 1 else 0.0
-            mean_day = statistics.mean(days)
-            mean_fp = statistics.mean(fps)
-            std_fp = statistics.stdev(fps) if len(fps) > 1 else 0.0
+            recalls.append(recall)
+            precisions.append(precision)
+            days.append(oracle.total_days_passed)
 
-            mean_recalls.append(mean_rec)
-            std_recalls.append(std_rec)
-            mean_precisions.append(mean_prec)
-            std_precisions.append(std_prec)
-            mean_days.append(mean_day)
-            mean_fp_rates.append(mean_fp)
-            std_fp_rates.append(std_fp)
+            if verbose_local:
+                print(f"trial {t+1}/{trials_local}, limit={limit}: recall={recall:.1f}%, precision={precision:.1f}%, days={oracle.total_days_passed}")
 
-            print(f"ratio={ratio} limit={limit} => FP={mean_fp:.3f}% ±{std_fp:.3f}, recall={mean_rec:5.2f}% ±{std_rec:5.2f}, prec={mean_prec:5.2f}% ±{std_prec:5.2f}, days={mean_day:.2f}")
+        # aggregate
+        mean_rec = statistics.mean(recalls)
+        std_rec = statistics.stdev(recalls) if len(recalls) > 1 else 0.0
+        mean_prec = statistics.mean(precisions)
+        std_prec = statistics.stdev(precisions) if len(precisions) > 1 else 0.0
+        mean_day = statistics.mean(days)
 
-        # store results per ratio
-        all_mean_recalls[ratio] = mean_recalls
-        all_std_recalls[ratio] = std_recalls
-        all_mean_precisions[ratio] = mean_precisions
-        all_std_precisions[ratio] = std_precisions
-        all_mean_days[ratio] = mean_days
-        all_mean_fp[ratio] = mean_fp_rates
-        all_std_fp[ratio] = std_fp_rates
+        mean_recalls.append(mean_rec)
+        std_recalls.append(std_rec)
+        mean_precisions.append(mean_prec)
+        std_precisions.append(std_prec)
+        mean_days.append(mean_day)
 
-    # Plot: one plot for recall (all ratios), one for precision
+        print(f"{limit:<12} | {mean_rec:6.1f}% ±{std_rec:5.2f}     | {mean_prec:6.1f}% ±{std_prec:5.2f}     | {mean_day:>12.2f}")
+
+    # PLOTTING
     plt.figure(figsize=(10, 6))
-    for ratio in M_N_RATIOS:
-        plt.errorbar(RATE_LIMITS, all_mean_recalls[ratio], yerr=all_std_recalls[ratio], marker='o', label=f"m/n={ratio}")
+    plt.errorbar(RATE_LIMITS_local, mean_recalls, yerr=std_recalls, marker='o', label='Recall (mean ± std)')
+    plt.errorbar(RATE_LIMITS_local, mean_precisions, yerr=std_precisions, marker='x', linestyle='--', label='Precision (mean ± std)')
+
+    plt.title(f'Attack Success vs. Rate Limit (with Data Churn)\nChurn={CHURN_PER_CYCLE_local} items per churn | trials={trials_local} | pairs={enable_pairs_local} | churn_model={churn_model_local}')
+    plt.xlabel('Allowed Queries per Cycle (Rate Limit)')
+    plt.ylabel('Attack Success (%)')
     plt.gca().invert_xaxis()
-    plt.title(f"Recall vs Rate Limit (m/n sweep)")
-    plt.xlabel("Allowed Queries per Cycle (Rate Limit)")
-    plt.ylabel("Recall (%)")
     plt.grid(True)
     plt.legend()
-    out_rec = output_filename if output_filename is not None else f"recall_mn_sweep.png"
-    plt.savefig(out_rec)
-    print(f"Saved recall plot to {out_rec}")
 
-    plt.figure(figsize=(10, 6))
-    for ratio in M_N_RATIOS:
-        plt.errorbar(RATE_LIMITS, all_mean_precisions[ratio], yerr=all_std_precisions[ratio], marker='x', linestyle='--', label=f"m/n={ratio}")
-    plt.gca().invert_xaxis()
-    plt.title(f"Precision vs Rate Limit (m/n sweep)")
-    plt.xlabel("Allowed Queries per Cycle (Rate Limit)")
-    plt.ylabel("Precision (%)")
-    plt.grid(True)
-    plt.legend()
-    out_prec = output_filename if output_filename is not None else f"precision_mn_sweep.png"
-    plt.savefig(out_prec)
-    print(f"Saved precision plot to {out_prec}")
+    if output_filename_local is None:
+        output_filename_local = f"churn_attack_results_trials{trials_local}_M{M_local}_N{N_local}_K{K_local}_pairs{enable_pairs_local}_churn-{churn_model_local}.png"
+    plt.savefig(output_filename_local)
+    print(f"\nGraph saved to {output_filename_local}")
 
-    # Also print a compact summary table of empirical FP (means) per ratio (they are independent of rate limit)
-    print("\nEmpirical FP summary (mean ± std) per m/n ratio (averaged across trials and rate limits):")
-    for ratio in M_N_RATIOS:
-        # compute average across rate_limits of the mean_fp list
-        fps_list = all_mean_fp[ratio]
-        avg_fp = statistics.mean(fps_list)
-        stdev_fp = statistics.mean(all_std_fp[ratio]) if len(all_std_fp[ratio]) > 0 else 0.0
-        print(f"m/n={ratio:>5} -> empirical FP (avg across rate_limits) = {avg_fp:.4f}%  (avg std {stdev_fp:.4f}%)")
-
-    print("\nDone.")
 
 if __name__ == "__main__":
     main()
